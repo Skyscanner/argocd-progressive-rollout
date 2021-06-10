@@ -333,7 +333,7 @@ var _ = Describe("ProgressiveRollout Controller", func() {
 			ExpectStageStatus(ctx, prKey, "stage 0").Should(MatchStage(syncv1alpha1.StageStatus{
 				Name:    "stage 0",
 				Phase:   syncv1alpha1.PhaseProgressing,
-				Message: "stage 0 stage in progress",
+				Message: "stage in progress",
 			}))
 			ExpectStagesInStatus(ctx, prKey).Should(Equal(1))
 
@@ -350,7 +350,7 @@ var _ = Describe("ProgressiveRollout Controller", func() {
 			ExpectStageStatus(ctx, prKey, "stage 0").Should(MatchStage(syncv1alpha1.StageStatus{
 				Name:    "stage 0",
 				Phase:   syncv1alpha1.PhaseSucceeded,
-				Message: "stage 0 stage completed",
+				Message: "stage completed",
 			}))
 
 			By("progressing in second application")
@@ -475,7 +475,7 @@ var _ = Describe("ProgressiveRollout Controller", func() {
 			ExpectStageStatus(ctx, prKey, "stage 0").Should(MatchStage(syncv1alpha1.StageStatus{
 				Name:    "stage 0",
 				Phase:   syncv1alpha1.PhaseProgressing,
-				Message: "stage 0 stage in progress",
+				Message: "stage in progress",
 			}))
 			ExpectStagesInStatus(ctx, prKey).Should(Equal(1))
 
@@ -492,7 +492,7 @@ var _ = Describe("ProgressiveRollout Controller", func() {
 			ExpectStageStatus(ctx, prKey, "stage 0").Should(MatchStage(syncv1alpha1.StageStatus{
 				Name:    "stage 0",
 				Phase:   syncv1alpha1.PhaseFailed,
-				Message: "stage 0 stage failed",
+				Message: "stage failed",
 			}))
 
 			createdPR := syncv1alpha1.ProgressiveSync{}
@@ -502,7 +502,7 @@ var _ = Describe("ProgressiveRollout Controller", func() {
 			}).Should(Equal(1))
 			Expect(createdPR.ObjectMeta.Finalizers[0]).To(Equal(syncv1alpha1.ProgressiveSyncFinalizer))
 
-			expected := failedStagePR.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionTrue, syncv1alpha1.StagesFailedReason, "stage 0 stage failed")
+			expected := failedStagePR.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionTrue, syncv1alpha1.StagesFailedReason, "stage failed")
 			ExpectCondition(&failedStagePR, expected.Type).Should(HaveStatus(expected.Status, expected.Reason, expected.Message))
 
 			deletedPR := syncv1alpha1.ProgressiveSync{}
