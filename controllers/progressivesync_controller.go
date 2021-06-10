@@ -66,7 +66,7 @@ func (r *ProgressiveSyncReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// Get the ProgressiveSync object
 	pr := syncv1alpha1.ProgressiveSync{}
 	if err := r.Get(ctx, req.NamespacedName, &pr); err != nil {
-		log.Error(err, "unable to fetch ProgressiveSync")
+		log.Error(err, "failed to fetch object")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	log = r.Log.WithValues("applicationset", pr.Spec.SourceRef.Name)
@@ -92,175 +92,32 @@ func (r *ProgressiveSyncReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Is this wrong here? Every time we reconcile an object we reset the status
-	if err := r.resetStatus(ctx, &pr); err != nil {
-		log.Error(err, "unable to initialize status")
-		return ctrl.Result{}, err
-	}
-
+	// Iterate over the ProgressiveSync stages
 	for _, stage := range pr.Spec.Stages {
-		log = log.WithValues("stage", stage.Name)
+		log = r.Log.WithValues("stage", stage.Name)
+		pr, result, err, requeue := r.reconcileStage(ctx, pr, stage)
 
-		// Get the clusters to update
-		clusters, err := r.getClustersFromSelector(ctx, stage.Targets.Clusters.Selector)
-		if err != nil {
-			message := "unable to fetch clusters"
-			log.Error(err, message)
-			r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseUnknown, &pr)
-
-			if err := r.updateStatusWithRetry(ctx, &pr); err != nil {
-				log.Error(err, "failed to update object status")
-				return ctrl.Result{}, err
-			}
-
-			return ctrl.Result{}, err
-		}
-		log.V(1).Info("clusters selected", "clusters", utils.GetClustersName(clusters.Items))
-
-		// Get only the Applications owned by the ProgressiveSync targeting the selected clusters
-		apps, err := r.getOwnedAppsFromClusters(ctx, clusters, &pr)
-		if err != nil {
-			message := "unable to fetch apps"
-			log.Error(err, message)
-			r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseUnknown, &pr)
-
-			if err := r.updateStatusWithRetry(ctx, &pr); err != nil {
-				log.Error(err, "failed to update object status")
-				return ctrl.Result{}, err
-			}
-
-			return ctrl.Result{}, err
-		}
-		log.V(1).Info("apps selected", "apps", utils.GetAppsName(apps))
-
-		// Remove the annotation from the OutOfSync Applications before passing them to the Scheduler
-		// This action allows the Scheduler to keep track at which stage an Application has been synced.
-		outOfSyncApps := utils.GetAppsBySyncStatusCode(apps, argov1alpha1.SyncStatusCodeOutOfSync)
-		if err := r.removeAnnotationFromApps(ctx, outOfSyncApps, utils.ProgressiveSyncSyncedAtStageKey); err != nil {
-			message := "unable to remove out-of-sync annotation"
-			log.Error(err, message)
-
-			r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseUnknown, &pr)
-
-			if err := r.updateStatusWithRetry(ctx, &pr); err != nil {
-				log.Error(err, "failed to update object status")
-				return ctrl.Result{}, err
-			}
+		if err := r.updateStatusWithRetry(ctx, &pr); err != nil {
+			log.Error(err, "failed to update object when reconciling stage")
 			return ctrl.Result{}, err
 		}
 
-		// Get the Applications to update
-		// TODO: update the scheduler to return the InProgress apps
-		scheduledApps := scheduler.Scheduler(apps, stage)
-
-		// TODO: status status - update targets
-
-		for _, s := range scheduledApps {
-			log.Info("syncing app", "app", s)
-
-			_, err := r.syncApp(ctx, s.Name)
-
-			if err != nil {
-				if !strings.Contains(err.Error(), "another operation is already in progress") {
-					message := "unable to remove out-of-sync annotation"
-					log.Error(err, message, "message", err.Error())
-
-					r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseUnknown, &pr)
-
-					// TODO: Should this be reflected in the general condition?
-					// failed := pr.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionTrue, syncv1alpha1.StagesFailedReason, message)
-					// apimeta.SetStatusCondition(pr.GetStatusConditions(), failed)
-					if err := r.updateStatusWithRetry(ctx, &pr); err != nil {
-						log.Error(err, "failed to update object status")
-						return ctrl.Result{}, err
-					}
-
-					// TODO: stage status - update failed clusters
-
-					return ctrl.Result{}, err
-				}
-			}
-		}
-
-		if scheduler.IsStageFailed(apps) {
-			failedMessage := fmt.Sprintf("%s stage failed", stage.Name)
-			log.Info(failedMessage)
-
-			r.updateStageStatus(ctx, stage.Name, failedMessage, syncv1alpha1.PhaseFailed, &pr)
-
-			failed := pr.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionTrue, syncv1alpha1.StagesFailedReason, failedMessage)
-			apimeta.SetStatusCondition(pr.GetStatusConditions(), failed)
-			if err := r.updateStatusWithRetry(ctx, &pr); err != nil {
-				log.Error(err, "failed to update object status")
-				return ctrl.Result{}, err
-			}
-			log.Info("rollout failed")
-			// We can set Requeue: true once we have a timeout in place
-			return ctrl.Result{}, nil
-		}
-
-		if scheduler.IsStageInProgress(apps) {
-			message := fmt.Sprintf("%s stage in progress", stage.Name)
-			log.Info(message)
-
-			r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseProgressing, &pr)
-
-			progress := pr.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionFalse, syncv1alpha1.StagesProgressingReason, message)
-			apimeta.SetStatusCondition(pr.GetStatusConditions(), progress)
-
-			if err := r.updateStatusWithRetry(ctx, &pr); err != nil {
-				log.Error(err, "failed to update object status")
-				return ctrl.Result{}, err
-			}
-
-			// Stage in progress, we reconcile again until the stage is completed or failed
-			return ctrl.Result{Requeue: true}, nil
-		}
-
-		if scheduler.IsStageComplete(apps) {
-			message := fmt.Sprintf("%s stage completed", stage.Name)
-			log.Info(message)
-
-			r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseSucceeded, &pr)
-
-			progress := pr.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionFalse, syncv1alpha1.StagesProgressingReason, message)
-			apimeta.SetStatusCondition(pr.GetStatusConditions(), progress)
-
-			if err := r.updateStatusWithRetry(ctx, &pr); err != nil {
-				log.Error(err, "failed to update object status")
-				return ctrl.Result{}, err
-			}
-
-		} else {
-			message := fmt.Sprintf("%s stage in unknown state", stage.Name)
-			log.Info(message)
-
-			r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseUnknown, &pr)
-
-			progress := pr.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionFalse, syncv1alpha1.StagesProgressingReason, message)
-			apimeta.SetStatusCondition(pr.GetStatusConditions(), progress)
-
-			if err := r.updateStatusWithRetry(ctx, &pr); err != nil {
-				log.Error(err, "failed to update object status")
-				return ctrl.Result{}, err
-			}
-
-			// We can set Requeue: true once we have a timeout in place
-			return ctrl.Result{}, nil
+		// Check if we should requeue or progressing to the next stage
+		if requeue {
+			log.Info("requeuing stage")
+			return result, err
 		}
 	}
-
-	log.Info("all stages completed")
 
 	// Progressive sync completed
 	completed := pr.NewStatusCondition(
 		syncv1alpha1.CompletedCondition,
 		metav1.ConditionTrue,
 		syncv1alpha1.StagesCompleteReason,
-		"All stages completed")
+		"Sync completed")
 	apimeta.SetStatusCondition(pr.GetStatusConditions(), completed)
 	if err := r.updateStatusWithRetry(ctx, &pr); err != nil {
-		log.Error(err, "failed to update object status")
+		log.Error(err, "failed to update object status when sync completed")
 		return ctrl.Result{}, err
 	}
 	log.Info("sync completed")
@@ -479,17 +336,112 @@ func (r *ProgressiveSyncReconciler) updateStatusWithRetry(ctx context.Context, p
 	return retryErr
 }
 
-// resetStatus initializes the progressive sync object status to prevent conflicts when updating status later on
-func (r *ProgressiveSyncReconciler) resetStatus(ctx context.Context, pr *syncv1alpha1.ProgressiveSync) error {
+// reconcileStage reconcile a ProgressiveSyncStage
+func (r *ProgressiveSyncReconciler) reconcileStage(ctx context.Context, pr syncv1alpha1.ProgressiveSync, stage syncv1alpha1.ProgressiveSyncStage) (syncv1alpha1.ProgressiveSync, reconcile.Result, error, bool) {
 
-	key := client.ObjectKeyFromObject(pr)
-	latest := syncv1alpha1.ProgressiveSync{}
-	if err := r.Client.Get(ctx, key, &latest); err != nil {
-		return err
+	log := r.Log.WithValues("stage", stage.Name)
+
+	// Get the clusters to update
+	clusters, err := r.getClustersFromSelector(ctx, stage.Targets.Clusters.Selector)
+	if err != nil {
+		message := "unable to get clusters from selector"
+		log.Error(err, message)
+		r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseUnknown, &pr)
+		return pr, ctrl.Result{}, err, false
 	}
-	latest.Status = syncv1alpha1.ProgressiveSyncStatus{}
-	condition := latest.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionFalse, syncv1alpha1.StagesInitializedReason, "Stages initialized")
-	apimeta.SetStatusCondition(latest.GetStatusConditions(), condition)
-	return nil
 
+	log.Info("clusters selected", "clusters", utils.GetClustersName(clusters.Items))
+
+	// Get only the Applications owned by the ProgressiveSync targeting the selected clusters
+	apps, err := r.getOwnedAppsFromClusters(ctx, clusters, &pr)
+	if err != nil {
+		message := "unable to get apps from clusters"
+		log.Error(err, message)
+		r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseUnknown, &pr)
+		return pr, ctrl.Result{}, err, false
+	}
+	log.Info("apps selected", "apps", utils.GetAppsName(apps))
+
+	// Remove the annotation from the OutOfSync Applications before passing them to the Scheduler
+	// This action allows the Scheduler to keep track at which stage an Application has been synced.
+	outOfSyncApps := utils.GetAppsBySyncStatusCode(apps, argov1alpha1.SyncStatusCodeOutOfSync)
+	if err := r.removeAnnotationFromApps(ctx, outOfSyncApps, utils.ProgressiveSyncSyncedAtStageKey); err != nil {
+		message := "unable to remove out-of-sync annotation from apps"
+		log.Error(err, message)
+		r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseUnknown, &pr)
+		return pr, ctrl.Result{}, err, false
+	}
+
+	// Get the Applications to update
+	// TODO: update the scheduler to return the InProgress apps
+	scheduledApps := scheduler.Scheduler(apps, stage)
+
+	// TODO: status status - update targets
+
+	for _, s := range scheduledApps {
+		log.Info("syncing app", "app", s)
+
+		_, err := r.syncApp(ctx, s.Name)
+
+		if err != nil {
+			if !strings.Contains(err.Error(), "another operation is already in progress") {
+				message := "unable to remove out-of-sync annotation"
+				log.Error(err, message, "message", err.Error())
+
+				r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseUnknown, &pr)
+
+				// TODO: stage status - update failed clusters
+				return pr, ctrl.Result{}, err, false
+			}
+		}
+	}
+
+	if scheduler.IsStageFailed(apps) {
+		message := "stage failed"
+		log.Info(message)
+
+		r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseFailed, &pr)
+
+		failed := pr.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionTrue, syncv1alpha1.StagesFailedReason, message)
+		apimeta.SetStatusCondition(pr.GetStatusConditions(), failed)
+		log.Info("stage failed")
+		// We can set Requeue: true once we have a timeout in place
+		return pr, ctrl.Result{}, nil, false
+	}
+
+	if scheduler.IsStageInProgress(apps) {
+		message := "stage in progress"
+		log.Info(message)
+
+		r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseProgressing, &pr)
+
+		progress := pr.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionFalse, syncv1alpha1.StagesProgressingReason, message)
+		apimeta.SetStatusCondition(pr.GetStatusConditions(), progress)
+		// Stage in progress, we reconcile again until the stage is completed or failed
+		return pr, ctrl.Result{Requeue: true}, nil, true
+	}
+
+	if scheduler.IsStageComplete(apps) {
+		message := "stage completed"
+		log.Info(message)
+
+		r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseSucceeded, &pr)
+
+		progress := pr.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionFalse, syncv1alpha1.StagesProgressingReason, message)
+		apimeta.SetStatusCondition(pr.GetStatusConditions(), progress)
+
+	} else {
+		message := "stage in unknown state"
+		log.Info(message)
+
+		r.updateStageStatus(ctx, stage.Name, message, syncv1alpha1.PhaseUnknown, &pr)
+
+		progress := pr.NewStatusCondition(syncv1alpha1.CompletedCondition, metav1.ConditionFalse, syncv1alpha1.StagesProgressingReason, message)
+		apimeta.SetStatusCondition(pr.GetStatusConditions(), progress)
+
+		// We can set Requeue: true once we have a timeout in place
+		return pr, ctrl.Result{}, nil, false
+	}
+
+	return pr, ctrl.Result{}, nil, false
 }
